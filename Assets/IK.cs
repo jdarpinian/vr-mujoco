@@ -1,7 +1,9 @@
-using UnityEngine;
+﻿using UnityEngine;
 using Mujoco;
 using System;
 using System.Collections.Generic;
+using MathNet.Numerics.LinearAlgebra;
+using MathNet.Numerics.LinearAlgebra.Double;
 
 public class IK : MonoBehaviour
 {
@@ -87,9 +89,15 @@ public class IK : MonoBehaviour
             int nq = _model->nq;
 
             // Target position and orientation.
-            double[] targetPos = new double[3] { target.position.x, target.position.y, target.position.z };
+            double[] targetPos = new double[3]
+            {
+                target.position.x,
+                target.position.z, // Swap Y and Z
+                target.position.y
+            };
+
             Quaternion unityQuat = target.rotation;
-            double[] targetQuat = new double[4] { unityQuat.w, unityQuat.x, unityQuat.y, unityQuat.z };
+            double[] targetQuat = ConvertUnityQuatToMujoco(unityQuat);
 
             // Initialize arrays for the Jacobian and error.
             double[] jac = new double[6 * nv];
@@ -181,7 +189,7 @@ public class IK : MonoBehaviour
                 Array.Copy(errRot, 0, err, errPos.Length, errRot.Length);
 
                 // Extract the Jacobian columns for the specified DOFs.
-                double[,] jacJoints = ExtractJacobianColumns(jac, _dofIndices);
+                Matrix<double> jacJoints = ExtractJacobianColumns(jac, _dofIndices, nv);
 
                 // Solve for joint updates using the nullspace method.
                 double[] updateJoints = NullspaceMethod(jacJoints, err, regularizationStrength);
@@ -299,85 +307,53 @@ public class IK : MonoBehaviour
         }
     }
 
-    double[,] ExtractJacobianColumns(double[] jac, int[] dofIndices)
+    Matrix<double> ExtractJacobianColumns(double[] jac, int[] dofIndices, int nv)
     {
-        unsafe
+        int errDim = jac.Length / nv;
+        int numJoints = dofIndices.Length;
+
+        // Create a matrix of size (errDim x numJoints)
+        var jacJoints = Matrix<double>.Build.Dense(errDim, numJoints);
+
+        for (int i = 0; i < errDim; i++)
         {
-            int errDim = jac.Length / _model->nv;
-            double[,] jacJoints = new double[errDim, dofIndices.Length];
-
-            for (int i = 0; i < errDim; i++)
+            for (int j = 0; j < numJoints; j++)
             {
-                for (int j = 0; j < dofIndices.Length; j++)
-                {
-                    jacJoints[i, j] = jac[i * _model->nv + dofIndices[j]];
-                }
+                jacJoints[i, j] = jac[i * nv + dofIndices[j]];
             }
-
-            return jacJoints;
         }
+
+        return jacJoints;
     }
 
-    double[] NullspaceMethod(double[,] jacJoints, double[] delta, double regularizationStrength)
+    double[] NullspaceMethod(Matrix<double> jacJoints, double[] delta, double regularizationStrength)
     {
-        int n = jacJoints.GetLength(1); // Number of joints
-        int m = jacJoints.GetLength(0); // Error dimension
+        int n = jacJoints.ColumnCount; // Number of joints
 
-        double[,] hessApprox = new double[n, n];
-        double[] jointDelta = new double[n];
-
-        // Compute J^T * J
-        for (int i = 0; i < n; i++)
+        // Compute J^T * J + λI
+        Matrix<double> hessApprox = jacJoints.TransposeThisAndMultiply(jacJoints);
+        if (regularizationStrength > 0)
         {
-            for (int j = 0; j < n; j++)
-            {
-                double sum = 0.0;
-                for (int k = 0; k < m; k++)
-                {
-                    sum += jacJoints[k, i] * jacJoints[k, j];
-                }
-                hessApprox[i, j] = sum;
-            }
-        }
-
-        // Add regularization
-        for (int i = 0; i < n; i++)
-        {
-            hessApprox[i, i] += regularizationStrength;
+            hessApprox = hessApprox + Matrix<double>.Build.DenseIdentity(n) * regularizationStrength;
         }
 
         // Compute J^T * delta
-        for (int i = 0; i < n; i++)
-        {
-            double sum = 0.0;
-            for (int k = 0; k < m; k++)
-            {
-                sum += jacJoints[k, i] * delta[k];
-            }
-            jointDelta[i] = sum;
-        }
+        Vector<double> jointDelta = jacJoints.TransposeThisAndMultiply(Vector<double>.Build.Dense(delta));
 
         // Solve the linear system
-        double[] dq = SolveLinearSystem(hessApprox, jointDelta);
-        return dq;
-    }
+        Vector<double> dq;
 
-    double[] SolveLinearSystem(double[,] A, double[] b)
-    {
-        // Use a simple linear solver (e.g., Gaussian elimination)
-        // For brevity, we'll use a placeholder method here.
-        // In practice, you should use a reliable linear algebra library.
-        int n = b.Length;
-        double[] x = new double[n];
-
-        // Placeholder implementation (this needs to be replaced with a real solver)
-        // You can use libraries like Math.NET Numerics for robust solutions.
-        for (int i = 0; i < n; i++)
+        try
         {
-            x[i] = b[i] / (A[i, i] + 1e-6); // Avoid division by zero
+            dq = hessApprox.Solve(jointDelta);
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"Failed to solve linear system: {e.Message}");
+            dq = Vector<double>.Build.Dense(n, 0);
         }
 
-        return x;
+        return dq.ToArray();
     }
 
     double Norm(double[] vec)
@@ -388,5 +364,14 @@ public class IK : MonoBehaviour
             sum += v * v;
         }
         return Math.Sqrt(sum);
+    }
+
+    double[] ConvertUnityQuatToMujoco(Quaternion unityQuat)
+    {
+        // Swap Y and Z axes to convert from Unity to MuJoCo coordinate system
+        Quaternion swappedQuat = new Quaternion(unityQuat.x, unityQuat.z, unityQuat.y, unityQuat.w);
+
+        // Rearrange components to MuJoCo's (w, x, y, z) format
+        return new double[4] { swappedQuat.w, swappedQuat.x, swappedQuat.y, swappedQuat.z };
     }
 }
