@@ -10,6 +10,7 @@ Thumbs.db
 [Bb]uilds/
 [Ll]ogs/
 [Uu]ser[Ss]ettings/
+.utmp/
 
 # Ignore auto-generated files from Unity and Visual Studio
 # Unity files

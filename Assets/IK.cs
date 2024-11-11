@@ -31,6 +31,32 @@ public class IK : MonoBehaviour
     private int _siteId;
     private int[] _dofIndices;
 
+    // Preallocated arrays and vectors to minimize allocations.
+    private double[] targetPos = new double[3];
+    private double[] targetQuat = new double[4];
+    private double[] siteXPos = new double[3];
+    private double[] siteXMat = new double[9];
+    private double[] siteXQuat = new double[4];
+    private double[] negSiteXQuat = new double[4];
+    private double[] errRotQuat = new double[4];
+    private double[] errRot = new double[3];
+    private double[] errPos = new double[3];
+    private double[] errArray = new double[6];
+    private double[] jacp;
+    private double[] jacr;
+    private double[] jac;
+    private double[] updateNV;
+    private Vector<double> deltaVector;
+    private Matrix<double> jacJoints;
+    private Matrix<double> hessApprox;
+    private Vector<double> jointDelta;
+    private Vector<double> dq;
+    private double[] qpos;
+
+    // Variables for the IK loop.
+    private int nv;
+    private int nq;
+
     void Start()
     {
         // Get the MuJoCo scene, model, and data.
@@ -51,10 +77,30 @@ public class IK : MonoBehaviour
             {
                 throw new Exception($"Site {site.MujocoName} not found");
             }
+
+            nv = _model->nv;
+            nq = _model->nq;
+
+            // Allocate arrays based on model sizes.
+            jacp = new double[3 * nv];
+            jacr = new double[3 * nv];
+            jac = new double[6 * nv];
+            updateNV = new double[nv];
+            qpos = new double[nq];
         }
 
         // Get the DOF indices for the actuators controlling the joints.
         _dofIndices = GetDofIndices(actuators);
+
+        // Preallocate matrices and vectors for Math.NET Numerics.
+        int errDim = 6;
+        int numJoints = _dofIndices.Length;
+
+        jacJoints = Matrix<double>.Build.Dense(errDim, numJoints);
+        hessApprox = Matrix<double>.Build.Dense(numJoints, numJoints);
+        jointDelta = Vector<double>.Build.Dense(numJoints);
+        dq = Vector<double>.Build.Dense(numJoints);
+        deltaVector = Vector<double>.Build.Dense(errDim);
     }
 
     void Update()
@@ -85,24 +131,15 @@ public class IK : MonoBehaviour
             int steps = 0;
             double errNorm = 0.0;
 
-            int nv = _model->nv;
-            int nq = _model->nq;
-
             // Target position and orientation.
-            double[] targetPos = new double[3]
-            {
-                target.position.x,
-                target.position.z, // Swap Y and Z
-                target.position.y
-            };
+            // Swap Y and Z axes to convert from Unity to MuJoCo coordinate system
+            Vector3 targetPosition = target.position;
+            targetPos[0] = targetPosition.x;
+            targetPos[1] = targetPosition.z; // Swap Y and Z
+            targetPos[2] = targetPosition.y;
 
             Quaternion unityQuat = target.rotation;
-            double[] targetQuat = ConvertUnityQuatToMujoco(unityQuat);
-
-            // Initialize arrays for the Jacobian and error.
-            double[] jac = new double[6 * nv];
-            double[] err = new double[6];
-            double[] updateNV = new double[nv];
+            ConvertUnityQuatToMujoco(unityQuat, targetQuat);
 
             // Main IK loop.
             for (steps = 0; steps < maxSteps; steps++)
@@ -113,9 +150,6 @@ public class IK : MonoBehaviour
                 MujocoLib.mj_fwdPosition(_model, _data);
 
                 // Get the current site position and orientation.
-                double[] siteXPos = new double[3];
-                double[] siteXMat = new double[9];
-
                 for (int i = 0; i < 3; i++)
                 {
                     siteXPos[i] = _data->site_xpos[_siteId * 3 + i];
@@ -126,7 +160,6 @@ public class IK : MonoBehaviour
                 }
 
                 // Compute positional error.
-                double[] errPos = new double[3];
                 for (int i = 0; i < 3; i++)
                 {
                     errPos[i] = targetPos[i] - siteXPos[i];
@@ -134,28 +167,25 @@ public class IK : MonoBehaviour
                 errNorm += Norm(errPos);
 
                 // Compute rotational error.
-                double[] siteXQuat = new double[4];
                 fixed (double* siteXQuatPtr = siteXQuat)
                 fixed (double* siteXMatPtr = siteXMat)
                 {
                     MujocoLib.mju_mat2Quat(siteXQuatPtr, siteXMatPtr);
                 }
-                double[] negSiteXQuat = new double[4];
                 fixed (double* negSiteXQuatPtr = negSiteXQuat)
                 fixed (double* siteXQuatPtr = siteXQuat)
                 {
                     MujocoLib.mju_negQuat(negSiteXQuatPtr, siteXQuatPtr);
                 }
 
-                double[] errRotQuat = new double[4];
                 fixed (double* errRotQuatPtr = errRotQuat)
-                fixed (double* targetQuatPtr = targetQuat)
                 fixed (double* negSiteXQuatPtr = negSiteXQuat)
+                fixed (double* targetQuatPtr = targetQuat)
                 {
-                    MujocoLib.mju_mulQuat(errRotQuatPtr, targetQuatPtr, negSiteXQuatPtr);
+                    // Swap the order here
+                    MujocoLib.mju_mulQuat(errRotQuatPtr, negSiteXQuatPtr, targetQuatPtr);
                 }
 
-                double[] errRot = new double[3];
                 fixed (double* errRotPtr = errRot)
                 fixed (double* errRotQuatPtr = errRotQuat)
                 {
@@ -172,8 +202,6 @@ public class IK : MonoBehaviour
                 }
 
                 // Compute the Jacobian.
-                double[] jacp = new double[3 * nv];
-                double[] jacr = new double[3 * nv];
                 fixed (double* jacpPtr = jacp)
                 fixed (double* jacrPtr = jacr)
                 {
@@ -184,17 +212,23 @@ public class IK : MonoBehaviour
                 Array.Copy(jacp, 0, jac, 0, jacp.Length);
                 Array.Copy(jacr, 0, jac, jacp.Length, jacr.Length);
 
-                // Combine position and rotation errors.
-                Array.Copy(errPos, 0, err, 0, errPos.Length);
-                Array.Copy(errRot, 0, err, errPos.Length, errRot.Length);
+                // Combine position and rotation errors into errArray.
+                Array.Copy(errPos, 0, errArray, 0, errPos.Length);
+                Array.Copy(errRot, 0, errArray, errPos.Length, errRot.Length);
 
                 // Extract the Jacobian columns for the specified DOFs.
-                Matrix<double> jacJoints = ExtractJacobianColumns(jac, _dofIndices, nv);
+                ExtractJacobianColumns(jac, _dofIndices, nv, jacJoints);
+
+                // Convert errArray to deltaVector.
+                for (int i = 0; i < errArray.Length; i++)
+                {
+                    deltaVector[i] = errArray[i];
+                }
 
                 // Solve for joint updates using the nullspace method.
-                double[] updateJoints = NullspaceMethod(jacJoints, err, regularizationStrength);
+                NullspaceMethod(jacJoints, deltaVector, regularizationStrength, hessApprox, jointDelta, dq);
 
-                double updateNorm = Norm(updateJoints);
+                double updateNorm = dq.L2Norm();
 
                 // Check for sufficient progress.
                 double progressCriterion = errNorm / updateNorm;
@@ -207,10 +241,8 @@ public class IK : MonoBehaviour
                 // Limit the update norm.
                 if (updateNorm > maxUpdateNorm)
                 {
-                    for (int i = 0; i < updateJoints.Length; i++)
-                    {
-                        updateJoints[i] *= maxUpdateNorm / updateNorm;
-                    }
+                    double scale = maxUpdateNorm / updateNorm;
+                    dq.Multiply(scale, result: dq);
                 }
 
                 // Zero out the update vector.
@@ -219,16 +251,13 @@ public class IK : MonoBehaviour
                 // Assign updates to the appropriate DOF indices.
                 for (int i = 0; i < _dofIndices.Length; i++)
                 {
-                    updateNV[_dofIndices[i]] = updateJoints[i];
+                    updateNV[_dofIndices[i]] = dq[i];
                 }
 
                 // Integrate positions.
-                unsafe
+                fixed (double* updateNVPtr = updateNV)
                 {
-                    fixed (double* updateNVPtr = updateNV)
-                    {
-                        MujocoLib.mj_integratePos(_model, _data->qpos, updateNVPtr, 1);
-                    }
+                    MujocoLib.mj_integratePos(_model, _data->qpos, updateNVPtr, 1);
                 }
 
                 // Ensure the positions are updated in the simulation.
@@ -236,13 +265,9 @@ public class IK : MonoBehaviour
             }
 
             // Prepare the result.
-            double[] qpos = new double[nq];
-            unsafe
+            for (int i = 0; i < nq; i++)
             {
-                for (int i = 0; i < nq; i++)
-                {
-                    qpos[i] = _data->qpos[i];
-                }
+                qpos[i] = _data->qpos[i];
             }
 
             return new IKResult
@@ -254,6 +279,7 @@ public class IK : MonoBehaviour
             };
         }
     }
+
 
     int[] GetDofIndices(MjActuator[] actuators)
     {
@@ -307,14 +333,12 @@ public class IK : MonoBehaviour
         }
     }
 
-    Matrix<double> ExtractJacobianColumns(double[] jac, int[] dofIndices, int nv)
+    void ExtractJacobianColumns(double[] jac, int[] dofIndices, int nv, Matrix<double> jacJoints)
     {
         int errDim = jac.Length / nv;
         int numJoints = dofIndices.Length;
 
-        // Create a matrix of size (errDim x numJoints)
-        var jacJoints = Matrix<double>.Build.Dense(errDim, numJoints);
-
+        // Reuse the existing matrix jacJoints
         for (int i = 0; i < errDim; i++)
         {
             for (int j = 0; j < numJoints; j++)
@@ -322,56 +346,58 @@ public class IK : MonoBehaviour
                 jacJoints[i, j] = jac[i * nv + dofIndices[j]];
             }
         }
-
-        return jacJoints;
     }
 
-    double[] NullspaceMethod(Matrix<double> jacJoints, double[] delta, double regularizationStrength)
+    void NullspaceMethod(Matrix<double> jacJoints, Vector<double> deltaVector, double regularizationStrength,
+                         Matrix<double> hessApprox, Vector<double> jointDelta, Vector<double> dq)
     {
         int n = jacJoints.ColumnCount; // Number of joints
 
-        // Compute J^T * J + λI
-        Matrix<double> hessApprox = jacJoints.TransposeThisAndMultiply(jacJoints);
+        // Compute J^T * J
+        jacJoints.TransposeThisAndMultiply(jacJoints, hessApprox);
+
         if (regularizationStrength > 0)
         {
-            hessApprox = hessApprox + Matrix<double>.Build.DenseIdentity(n) * regularizationStrength;
+            for (int i = 0; i < n; i++)
+            {
+                hessApprox[i, i] += regularizationStrength;
+            }
         }
 
         // Compute J^T * delta
-        Vector<double> jointDelta = jacJoints.TransposeThisAndMultiply(Vector<double>.Build.Dense(delta));
+        jacJoints.TransposeThisAndMultiply(deltaVector, jointDelta);
 
-        // Solve the linear system
-        Vector<double> dq;
-
+        // Solve the linear system hessApprox * dq = jointDelta
         try
         {
-            dq = hessApprox.Solve(jointDelta);
+            hessApprox.Solve(jointDelta, result: dq);
         }
         catch (Exception e)
         {
             Debug.LogError($"Failed to solve linear system: {e.Message}");
-            dq = Vector<double>.Build.Dense(n, 0);
+            dq.Clear();
         }
-
-        return dq.ToArray();
     }
 
     double Norm(double[] vec)
     {
         double sum = 0.0;
-        foreach (var v in vec)
+        for (int i = 0; i < vec.Length; i++)
         {
-            sum += v * v;
+            sum += vec[i] * vec[i];
         }
         return Math.Sqrt(sum);
     }
 
-    double[] ConvertUnityQuatToMujoco(Quaternion unityQuat)
+    void ConvertUnityQuatToMujoco(Quaternion unityQuat, double[] targetQuat)
     {
         // Swap Y and Z axes to convert from Unity to MuJoCo coordinate system
         Quaternion swappedQuat = new Quaternion(unityQuat.x, unityQuat.z, unityQuat.y, unityQuat.w);
 
         // Rearrange components to MuJoCo's (w, x, y, z) format
-        return new double[4] { swappedQuat.w, swappedQuat.x, swappedQuat.y, swappedQuat.z };
+        targetQuat[0] = swappedQuat.w;
+        targetQuat[1] = swappedQuat.x;
+        targetQuat[2] = swappedQuat.y;
+        targetQuat[3] = swappedQuat.z;
     }
 }
