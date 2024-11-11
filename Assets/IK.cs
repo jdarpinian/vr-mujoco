@@ -105,12 +105,27 @@ public class IK : MonoBehaviour
 
     void Update()
     {
-        // Perform inverse kinematics to move the site towards the target.
-        IKResult result = QPosFromSitePose();
-
-        if (!result.success)
+        unsafe
         {
-            Debug.LogWarning($"IK did not converge: error norm = {result.errNorm}");
+            // Create a copy of mjData
+            MujocoLib.mjData_* dataCopy = MujocoLib.mj_makeData(_model);
+
+            // Copy the current data into dataCopy
+            MujocoLib.mj_copyData(dataCopy, _model, _data);
+
+            // Perform inverse kinematics on the copied data
+            IKResult result = QPosFromSitePose(_model, dataCopy);
+
+            if (!result.success)
+            {
+                Debug.LogWarning($"IK did not converge: error norm = {result.errNorm}");
+            }
+
+            // Free the copied data to prevent memory leaks
+            MujocoLib.mj_deleteData(dataCopy);
+
+            // Use the actuators to drive the joints toward the IK result
+            SetActuatorsToIKResult(result.qpos);
         }
     }
 
@@ -122,170 +137,178 @@ public class IK : MonoBehaviour
         public bool success;
     }
 
-    IKResult QPosFromSitePose()
+    unsafe IKResult QPosFromSitePose(MujocoLib.mjModel_* model, MujocoLib.mjData_* data)
+    {
+        bool success = false;
+        int steps = 0;
+        double errNorm = 0.0;
+
+        // Target position and orientation.
+        Vector3 targetPosition = target.position;
+        targetPos[0] = targetPosition.x;
+        targetPos[1] = targetPosition.z;
+        targetPos[2] = targetPosition.y;
+
+        Quaternion unityQuat = target.rotation;
+        ConvertUnityQuatToMujoco(unityQuat, targetQuat);
+
+        for (steps = 0; steps < maxSteps; steps++)
+        {
+            errNorm = 0.0;
+
+            // Perform forward kinematics.
+            MujocoLib.mj_fwdPosition(model, data);
+
+            // Get the current site position and orientation.
+            for (int i = 0; i < 3; i++)
+            {
+                siteXPos[i] = data->site_xpos[_siteId * 3 + i];
+            }
+            for (int i = 0; i < 9; i++)
+            {
+                siteXMat[i] = data->site_xmat[_siteId * 9 + i];
+            }
+
+            // Compute positional error.
+            for (int i = 0; i < 3; i++)
+            {
+                errPos[i] = targetPos[i] - siteXPos[i];
+            }
+            errNorm += Norm(errPos);
+
+            // Compute rotational error.
+            fixed (double* siteXQuatPtr = siteXQuat)
+            fixed (double* siteXMatPtr = siteXMat)
+            {
+                MujocoLib.mju_mat2Quat(siteXQuatPtr, siteXMatPtr);
+            }
+            fixed (double* negSiteXQuatPtr = negSiteXQuat)
+            fixed (double* siteXQuatPtr = siteXQuat)
+            {
+                MujocoLib.mju_negQuat(negSiteXQuatPtr, siteXQuatPtr);
+            }
+
+            fixed (double* errRotQuatPtr = errRotQuat)
+            fixed (double* negSiteXQuatPtr = negSiteXQuat)
+            fixed (double* targetQuatPtr = targetQuat)
+            {
+                MujocoLib.mju_mulQuat(errRotQuatPtr, negSiteXQuatPtr, targetQuatPtr);
+            }
+
+            fixed (double* errRotPtr = errRot)
+            fixed (double* errRotQuatPtr = errRotQuat)
+            {
+                MujocoLib.mju_quat2Vel(errRotPtr, errRotQuatPtr, 1);
+            }
+
+            errNorm += Norm(errRot) * rotationWeight;
+
+            // Check for convergence.
+            if (errNorm < tolerance)
+            {
+                success = true;
+                break;
+            }
+
+            // Compute the Jacobian.
+            fixed (double* jacpPtr = jacp)
+            fixed (double* jacrPtr = jacr)
+            {
+                MujocoLib.mj_jacSite(model, data, jacpPtr, jacrPtr, _siteId);
+            }
+
+            Array.Copy(jacp, 0, jac, 0, jacp.Length);
+            Array.Copy(jacr, 0, jac, jacp.Length, jacr.Length);
+
+            Array.Copy(errPos, 0, errArray, 0, errPos.Length);
+            Array.Copy(errRot, 0, errArray, errPos.Length, errRot.Length);
+
+            ExtractJacobianColumns(jac, _dofIndices, nv, jacJoints);
+
+            for (int i = 0; i < errArray.Length; i++)
+            {
+                deltaVector[i] = errArray[i];
+            }
+
+            NullspaceMethod(jacJoints, deltaVector, regularizationStrength, hessApprox, jointDelta, dq);
+
+            double updateNorm = dq.L2Norm();
+
+            if (updateNorm > maxUpdateNorm)
+            {
+                double scale = maxUpdateNorm / updateNorm;
+                dq.Multiply(scale, result: dq);
+            }
+
+            Array.Clear(updateNV, 0, updateNV.Length);
+
+            for (int i = 0; i < _dofIndices.Length; i++)
+            {
+                updateNV[_dofIndices[i]] = dq[i];
+            }
+
+            fixed (double* updateNVPtr = updateNV)
+            {
+                MujocoLib.mj_integratePos(model, data->qpos, updateNVPtr, 1);
+            }
+
+            MujocoLib.mj_fwdPosition(model, data);
+        }
+
+        for (int i = 0; i < nq; i++)
+        {
+            qpos[i] = data->qpos[i];
+        }
+
+        return new IKResult
+        {
+            qpos = qpos,
+            errNorm = errNorm,
+            steps = steps,
+            success = success
+        };
+    }
+
+    void SetActuatorsToIKResult(double[] targetQpos)
     {
         unsafe
         {
-            // Initialize variables.
-            bool success = false;
-            int steps = 0;
-            double errNorm = 0.0;
-
-            // Target position and orientation.
-            // Swap Y and Z axes to convert from Unity to MuJoCo coordinate system
-            Vector3 targetPosition = target.position;
-            targetPos[0] = targetPosition.x;
-            targetPos[1] = targetPosition.z; // Swap Y and Z
-            targetPos[2] = targetPosition.y;
-
-            Quaternion unityQuat = target.rotation;
-            ConvertUnityQuatToMujoco(unityQuat, targetQuat);
-
-            // Main IK loop.
-            for (steps = 0; steps < maxSteps; steps++)
+            for (int i = 0; i < actuators.Length; i++)
             {
-                errNorm = 0.0;
-
-                // Perform forward kinematics.
-                MujocoLib.mj_fwdPosition(_model, _data);
-
-                // Get the current site position and orientation.
-                for (int i = 0; i < 3; i++)
+                var actuator = actuators[i];
+                var joint = actuator.Joint;
+                if (joint == null)
                 {
-                    siteXPos[i] = _data->site_xpos[_siteId * 3 + i];
-                }
-                for (int i = 0; i < 9; i++)
-                {
-                    siteXMat[i] = _data->site_xmat[_siteId * 9 + i];
+                    continue;
                 }
 
-                // Compute positional error.
-                for (int i = 0; i < 3; i++)
+                int jointId = MujocoLib.mj_name2id(_model, (int)MujocoLib.mjtObj.mjOBJ_JOINT, joint.MujocoName);
+                if (jointId == -1)
                 {
-                    errPos[i] = targetPos[i] - siteXPos[i];
-                }
-                errNorm += Norm(errPos);
-
-                // Compute rotational error.
-                fixed (double* siteXQuatPtr = siteXQuat)
-                fixed (double* siteXMatPtr = siteXMat)
-                {
-                    MujocoLib.mju_mat2Quat(siteXQuatPtr, siteXMatPtr);
-                }
-                fixed (double* negSiteXQuatPtr = negSiteXQuat)
-                fixed (double* siteXQuatPtr = siteXQuat)
-                {
-                    MujocoLib.mju_negQuat(negSiteXQuatPtr, siteXQuatPtr);
+                    Debug.LogWarning($"Joint {joint.MujocoName} not found");
+                    continue;
                 }
 
-                fixed (double* errRotQuatPtr = errRotQuat)
-                fixed (double* negSiteXQuatPtr = negSiteXQuat)
-                fixed (double* targetQuatPtr = targetQuat)
-                {
-                    // Swap the order here
-                    MujocoLib.mju_mulQuat(errRotQuatPtr, negSiteXQuatPtr, targetQuatPtr);
-                }
+                int dofAdr = _model->jnt_dofadr[jointId];
 
-                fixed (double* errRotPtr = errRot)
-                fixed (double* errRotQuatPtr = errRotQuat)
-                {
-                    MujocoLib.mju_quat2Vel(errRotPtr, errRotQuatPtr, 1);
-                }
+                double currentQpos = _data->qpos[dofAdr];
+                double desiredQpos = targetQpos[dofAdr];
 
-                errNorm += Norm(errRot) * rotationWeight;
+                double positionError = desiredQpos - currentQpos;
 
-                // Check for convergence.
-                if (errNorm < tolerance)
-                {
-                    success = true;
-                    break;
-                }
+                double gain = 100.0; // Adjust this gain as needed
+                double controlInput = gain * positionError;
 
-                // Compute the Jacobian.
-                fixed (double* jacpPtr = jacp)
-                fixed (double* jacrPtr = jacr)
-                {
-                    MujocoLib.mj_jacSite(_model, _data, jacpPtr, jacrPtr, _siteId);
-                }
-
-                // Combine position and rotation Jacobians.
-                Array.Copy(jacp, 0, jac, 0, jacp.Length);
-                Array.Copy(jacr, 0, jac, jacp.Length, jacr.Length);
-
-                // Combine position and rotation errors into errArray.
-                Array.Copy(errPos, 0, errArray, 0, errPos.Length);
-                Array.Copy(errRot, 0, errArray, errPos.Length, errRot.Length);
-
-                // Extract the Jacobian columns for the specified DOFs.
-                ExtractJacobianColumns(jac, _dofIndices, nv, jacJoints);
-
-                // Convert errArray to deltaVector.
-                for (int i = 0; i < errArray.Length; i++)
-                {
-                    deltaVector[i] = errArray[i];
-                }
-
-                // Solve for joint updates using the nullspace method.
-                NullspaceMethod(jacJoints, deltaVector, regularizationStrength, hessApprox, jointDelta, dq);
-
-                double updateNorm = dq.L2Norm();
-
-                // Check for sufficient progress.
-                double progressCriterion = errNorm / updateNorm;
-                if (progressCriterion > progressThreshold)
-                {
-                    Debug.LogWarning($"Insufficient progress at step {steps}: progress criterion = {progressCriterion}");
-                    break;
-                }
-
-                // Limit the update norm.
-                if (updateNorm > maxUpdateNorm)
-                {
-                    double scale = maxUpdateNorm / updateNorm;
-                    dq.Multiply(scale, result: dq);
-                }
-
-                // Zero out the update vector.
-                Array.Clear(updateNV, 0, updateNV.Length);
-
-                // Assign updates to the appropriate DOF indices.
-                for (int i = 0; i < _dofIndices.Length; i++)
-                {
-                    updateNV[_dofIndices[i]] = dq[i];
-                }
-
-                // Integrate positions.
-                fixed (double* updateNVPtr = updateNV)
-                {
-                    MujocoLib.mj_integratePos(_model, _data->qpos, updateNVPtr, 1);
-                }
-
-                // Ensure the positions are updated in the simulation.
-                MujocoLib.mj_fwdPosition(_model, _data);
+                _data->ctrl[actuator.MujocoId] = desiredQpos;
+                actuator.Control = (float)desiredQpos;
             }
-
-            // Prepare the result.
-            for (int i = 0; i < nq; i++)
-            {
-                qpos[i] = _data->qpos[i];
-            }
-
-            return new IKResult
-            {
-                qpos = qpos,
-                errNorm = errNorm,
-                steps = steps,
-                success = success
-            };
         }
     }
-
 
     int[] GetDofIndices(MjActuator[] actuators)
     {
         unsafe
         {
-            // Collect all DOF indices associated with the joints controlled by the actuators.
             List<int> dofIndices = new List<int>();
 
             foreach (var actuator in actuators)
@@ -318,7 +341,6 @@ public class IK : MonoBehaviour
 
     int GetJointDofNum(int jointType)
     {
-        // Determine the number of DOFs based on joint type.
         switch (jointType)
         {
             case (int)MujocoLib.mjtJoint.mjJNT_FREE:
@@ -338,7 +360,6 @@ public class IK : MonoBehaviour
         int errDim = jac.Length / nv;
         int numJoints = dofIndices.Length;
 
-        // Reuse the existing matrix jacJoints
         for (int i = 0; i < errDim; i++)
         {
             for (int j = 0; j < numJoints; j++)
@@ -351,9 +372,8 @@ public class IK : MonoBehaviour
     void NullspaceMethod(Matrix<double> jacJoints, Vector<double> deltaVector, double regularizationStrength,
                          Matrix<double> hessApprox, Vector<double> jointDelta, Vector<double> dq)
     {
-        int n = jacJoints.ColumnCount; // Number of joints
+        int n = jacJoints.ColumnCount;
 
-        // Compute J^T * J
         jacJoints.TransposeThisAndMultiply(jacJoints, hessApprox);
 
         if (regularizationStrength > 0)
@@ -364,10 +384,8 @@ public class IK : MonoBehaviour
             }
         }
 
-        // Compute J^T * delta
         jacJoints.TransposeThisAndMultiply(deltaVector, jointDelta);
 
-        // Solve the linear system hessApprox * dq = jointDelta
         try
         {
             hessApprox.Solve(jointDelta, result: dq);
@@ -391,10 +409,7 @@ public class IK : MonoBehaviour
 
     void ConvertUnityQuatToMujoco(Quaternion unityQuat, double[] targetQuat)
     {
-        // Swap Y and Z axes to convert from Unity to MuJoCo coordinate system
         Quaternion swappedQuat = new Quaternion(unityQuat.x, unityQuat.z, unityQuat.y, unityQuat.w);
-
-        // Rearrange components to MuJoCo's (w, x, y, z) format
         targetQuat[0] = swappedQuat.w;
         targetQuat[1] = swappedQuat.x;
         targetQuat[2] = swappedQuat.y;
