@@ -2,8 +2,11 @@
 using Mujoco;
 using System;
 using System.Collections.Generic;
+using Accord.Math;
+using Accord.Math.Optimization;
 using MathNet.Numerics.LinearAlgebra;
 using MathNet.Numerics.LinearAlgebra.Double;
+using System.Linq;
 
 public class IK : MonoBehaviour
 {
@@ -19,7 +22,6 @@ public class IK : MonoBehaviour
     // Parameters for the IK algorithm.
     public double tolerance = 1e-14;
     public double rotationWeight = 1.0;
-    public double regularizationThreshold = 0.1;
     public double regularizationStrength = 3e-2;
     public double maxUpdateNorm = 2.0;
     public double progressThreshold = 20.0;
@@ -48,14 +50,16 @@ public class IK : MonoBehaviour
     private double[] updateNV;
     private Vector<double> deltaVector;
     private Matrix<double> jacJoints;
-    private Matrix<double> hessApprox;
-    private Vector<double> jointDelta;
-    private Vector<double> dq;
     private double[] qpos;
 
     // Variables for the IK loop.
     private int nv;
     private int nq;
+
+    // Joint limits per qpos index.
+    private double[] lowerLimits;
+    private double[] upperLimits;
+    private int[] qposIndices;
 
     void Start()
     {
@@ -97,19 +101,48 @@ public class IK : MonoBehaviour
         int numJoints = _dofIndices.Length;
 
         jacJoints = Matrix<double>.Build.Dense(errDim, numJoints);
-        hessApprox = Matrix<double>.Build.Dense(numJoints, numJoints);
-        jointDelta = Vector<double>.Build.Dense(numJoints);
-        dq = Vector<double>.Build.Dense(numJoints);
         deltaVector = Vector<double>.Build.Dense(errDim);
-    }
 
-    void Update()
-    {
+        // Collect joint limits from actuators.
+        lowerLimits = new double[numJoints];
+        upperLimits = new double[numJoints];
+
         unsafe
         {
-            // Create a copy of mjData
-            MujocoLib.mjData_* dataCopy = MujocoLib.mj_makeData(_model);
+            for (int i = 0; i < actuators.Length; i++)
+            {
+                var actuator = actuators[i];
+                var joint = actuator.Joint;
+                if (joint == null)
+                {
+                    continue;
+                }
 
+                int jointId = joint.MujocoId;
+                int dofAdr = _model->jnt_dofadr[jointId];
+                int dofNum = GetJointDofNum(_model->jnt_type[jointId]);
+
+                Vector2 ctrlRange = actuator.CommonParams.CtrlRange;
+                double lowerLimit = ctrlRange.x;
+                double upperLimit = ctrlRange.y;
+
+                for (int j = 0; j < dofNum; j++)
+                {
+                    int index = i * dofNum + j;
+                    lowerLimits[index] = lowerLimit;
+                    upperLimits[index] = upperLimit;
+                }
+            }
+        }
+    }
+
+    unsafe void Update()
+    {
+        // Create a copy of mjData
+        MujocoLib.mjData_* dataCopy = MujocoLib.mj_makeData(_model);
+
+        try
+        {
             // Copy the current data into dataCopy
             MujocoLib.mj_copyData(dataCopy, _model, _data);
 
@@ -121,11 +154,13 @@ public class IK : MonoBehaviour
                 Debug.LogWarning($"IK did not converge: error norm = {result.errNorm}");
             }
 
-            // Free the copied data to prevent memory leaks
-            MujocoLib.mj_deleteData(dataCopy);
-
             // Use the actuators to drive the joints toward the IK result
             SetActuatorsToIKResult(result.qpos);
+        }
+        finally
+        {
+            // Free the copied data to prevent memory leaks
+            MujocoLib.mj_deleteData(dataCopy);
         }
     }
 
@@ -144,13 +179,20 @@ public class IK : MonoBehaviour
         double errNorm = 0.0;
 
         // Target position and orientation.
-        Vector3 targetPosition = target.position;
+        var targetPosition = target.position;
         targetPos[0] = targetPosition.x;
         targetPos[1] = targetPosition.z;
         targetPos[2] = targetPosition.y;
 
         Quaternion unityQuat = target.rotation;
         ConvertUnityQuatToMujoco(unityQuat, targetQuat);
+
+        // Get current qpos
+        double[] qposCurrent = new double[_dofIndices.Length];
+        for (int i = 0; i < _dofIndices.Length; i++)
+        {
+            qposCurrent[i] = data->qpos[_dofIndices[i]];
+        }
 
         for (steps = 0; steps < maxSteps; steps++)
         {
@@ -230,28 +272,31 @@ public class IK : MonoBehaviour
                 deltaVector[i] = errArray[i];
             }
 
-            NullspaceMethod(jacJoints, deltaVector, regularizationStrength, hessApprox, jointDelta, dq);
+            // Solve for joint updates using the QP solver with joint limits
+            double[] dq = SolveQP(jacJoints, deltaVector.ToArray(), regularizationStrength, qposCurrent, lowerLimits, upperLimits);
 
-            double updateNorm = dq.L2Norm();
+            double updateNorm = Norm(dq);
 
             if (updateNorm > maxUpdateNorm)
             {
                 double scale = maxUpdateNorm / updateNorm;
-                dq.Multiply(scale, result: dq);
+                for (int i = 0; i < dq.Length; i++)
+                {
+                    dq[i] *= scale;
+                }
             }
 
-            Array.Clear(updateNV, 0, updateNV.Length);
-
-            for (int i = 0; i < _dofIndices.Length; i++)
+            // Update qposCurrent
+            for (int i = 0; i < qposCurrent.Length; i++)
             {
-                updateNV[_dofIndices[i]] = dq[i];
+                qposCurrent[i] += dq[i];
+                // Ensure qposCurrent is within limits
+                qposCurrent[i] = Math.Max(lowerLimits[i], Math.Min(upperLimits[i], qposCurrent[i]));
+                // Update data->qpos
+                data->qpos[_dofIndices[i]] = qposCurrent[i];
             }
 
-            fixed (double* updateNVPtr = updateNV)
-            {
-                MujocoLib.mj_integratePos(model, data->qpos, updateNVPtr, 1);
-            }
-
+            // Perform forward kinematics with updated positions
             MujocoLib.mj_fwdPosition(model, data);
         }
 
@@ -269,74 +314,56 @@ public class IK : MonoBehaviour
         };
     }
 
-    void SetActuatorsToIKResult(double[] targetQpos)
+    unsafe void SetActuatorsToIKResult(double[] targetQpos)
     {
-        unsafe
+        // For each actuator, set its Control property to the desired joint position
+        for (int i = 0; i < actuators.Length; i++)
         {
-            for (int i = 0; i < actuators.Length; i++)
+            var actuator = actuators[i];
+            var joint = actuator.Joint;
+            if (joint == null)
             {
-                var actuator = actuators[i];
-                var joint = actuator.Joint;
-                if (joint == null)
-                {
-                    continue;
-                }
+                continue;
+            }
 
-                int jointId = MujocoLib.mj_name2id(_model, (int)MujocoLib.mjtObj.mjOBJ_JOINT, joint.MujocoName);
-                if (jointId == -1)
-                {
-                    Debug.LogWarning($"Joint {joint.MujocoName} not found");
-                    continue;
-                }
+            int jointId = joint.MujocoId;
+            int qposAdr = _model->jnt_qposadr[jointId];
 
-                int dofAdr = _model->jnt_dofadr[jointId];
+            // Get the desired position for this joint
+            double desiredQpos = targetQpos[qposAdr];
 
-                double currentQpos = _data->qpos[dofAdr];
-                double desiredQpos = targetQpos[dofAdr];
-
-                double positionError = desiredQpos - currentQpos;
-
-                double gain = 100.0; // Adjust this gain as needed
-                double controlInput = gain * positionError;
-
+            // Set the actuator's Control property and _data->ctrl
+            actuator.Control = (float)desiredQpos;
+            unsafe
+            {
                 _data->ctrl[actuator.MujocoId] = desiredQpos;
-                actuator.Control = (float)desiredQpos;
             }
         }
     }
 
-    int[] GetDofIndices(MjActuator[] actuators)
+    unsafe int[] GetDofIndices(MjActuator[] actuators)
     {
-        unsafe
+        List<int> dofIndices = new List<int>();
+
+        foreach (var actuator in actuators)
         {
-            List<int> dofIndices = new List<int>();
-
-            foreach (var actuator in actuators)
+            var joint = actuator.Joint;
+            if (joint == null)
             {
-                var joint = actuator.Joint;
-                if (joint == null)
-                {
-                    continue;
-                }
-
-                int jointId = MujocoLib.mj_name2id(_model, (int)MujocoLib.mjtObj.mjOBJ_JOINT, joint.MujocoName);
-                if (jointId == -1)
-                {
-                    Debug.LogWarning($"Joint {joint.MujocoName} not found");
-                    continue;
-                }
-
-                int dofAdr = _model->jnt_dofadr[jointId];
-                int dofNum = GetJointDofNum(_model->jnt_type[jointId]);
-
-                for (int i = 0; i < dofNum; i++)
-                {
-                    dofIndices.Add(dofAdr + i);
-                }
+                continue;
             }
 
-            return dofIndices.ToArray();
+            int jointId = joint.MujocoId;
+            int dofAdr = _model->jnt_dofadr[jointId];
+            int dofNum = GetJointDofNum(_model->jnt_type[jointId]);
+
+            for (int i = 0; i < dofNum; i++)
+            {
+                dofIndices.Add(dofAdr + i);
+            }
         }
+
+        return dofIndices.ToArray();
     }
 
     int GetJointDofNum(int jointType)
@@ -369,34 +396,6 @@ public class IK : MonoBehaviour
         }
     }
 
-    void NullspaceMethod(Matrix<double> jacJoints, Vector<double> deltaVector, double regularizationStrength,
-                         Matrix<double> hessApprox, Vector<double> jointDelta, Vector<double> dq)
-    {
-        int n = jacJoints.ColumnCount;
-
-        jacJoints.TransposeThisAndMultiply(jacJoints, hessApprox);
-
-        if (regularizationStrength > 0)
-        {
-            for (int i = 0; i < n; i++)
-            {
-                hessApprox[i, i] += regularizationStrength;
-            }
-        }
-
-        jacJoints.TransposeThisAndMultiply(deltaVector, jointDelta);
-
-        try
-        {
-            hessApprox.Solve(jointDelta, result: dq);
-        }
-        catch (Exception e)
-        {
-            Debug.LogError($"Failed to solve linear system: {e.Message}");
-            dq.Clear();
-        }
-    }
-
     double Norm(double[] vec)
     {
         double sum = 0.0;
@@ -409,10 +408,80 @@ public class IK : MonoBehaviour
 
     void ConvertUnityQuatToMujoco(Quaternion unityQuat, double[] targetQuat)
     {
+        // Swap Y and Z axes to convert from Unity to MuJoCo coordinate system
         Quaternion swappedQuat = new Quaternion(unityQuat.x, unityQuat.z, unityQuat.y, unityQuat.w);
+
+        // Rearrange components to MuJoCo's (w, x, y, z) format
         targetQuat[0] = swappedQuat.w;
         targetQuat[1] = swappedQuat.x;
         targetQuat[2] = swappedQuat.y;
         targetQuat[3] = swappedQuat.z;
     }
+
+    double[] SolveQP(Matrix<double> jacJoints, double[] delta, double regularizationStrength,
+                     double[] qposCurrent, double[] lowerLimits, double[] upperLimits)
+    {
+        int n = jacJoints.ColumnCount; // Number of joints
+
+        // Formulate the QP problem: minimize 0.5 * x^T H x - f^T x
+        // H = J^T J + regularization * I
+        // f = -J^T delta
+
+        Matrix<double> H = jacJoints.TransposeThisAndMultiply(jacJoints);
+        if (regularizationStrength > 0)
+        {
+            H = H + Matrix<double>.Build.DenseIdentity(n) * regularizationStrength;
+        }
+
+        Vector<double> f = -jacJoints.TransposeThisAndMultiply(Vector<double>.Build.Dense(delta));
+
+        // Convert H and f to Accord.NET formats
+        double[,] HAccord = H.ToArray();
+        double[] fAccord = f.ToArray();
+
+        // Define the objective function
+        var objectiveFunction = new QuadraticObjectiveFunction(HAccord, fAccord);
+
+        // Define inequality constraints for joint limits
+        List<LinearConstraint> constraints = new List<LinearConstraint>();
+        for (int i = 0; i < n; i++)
+        {
+            // Create CombinedAs array with zeros and a single 1.0 at index i
+            double[] combinedUpper = new double[n];
+            double[] combinedLower = new double[n];
+            combinedUpper[i] = 1.0;
+            combinedLower[i] = 1.0;
+
+            // Upper limit constraint: dq[i] <= upperLimits[i] - qposCurrent[i]
+            constraints.Add(new LinearConstraint(numberOfVariables: n)
+            {
+                VariablesAtIndices = Enumerable.Range(0, n).ToArray(),
+                CombinedAs = combinedUpper,
+                ShouldBe = ConstraintType.LesserThanOrEqualTo,
+                Value = upperLimits[i] - qposCurrent[i]
+            });
+
+            // Lower limit constraint: dq[i] >= lowerLimits[i] - qposCurrent[i]
+            constraints.Add(new LinearConstraint(numberOfVariables: n)
+            {
+                VariablesAtIndices = Enumerable.Range(0, n).ToArray(),
+                CombinedAs = combinedLower,
+                ShouldBe = ConstraintType.GreaterThanOrEqualTo,
+                Value = lowerLimits[i] - qposCurrent[i]
+            });
+        }
+
+        // Create and solve the QP problem
+        var solver = new GoldfarbIdnani(objectiveFunction, constraints);
+
+        bool success = solver.Minimize();
+        if (!success)
+        {
+            Debug.LogError("QP Solver failed to find a solution.");
+            return new double[n];
+        }
+
+        return solver.Solution;
+    }
+
 }
