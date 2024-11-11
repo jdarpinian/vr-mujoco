@@ -95,6 +95,16 @@ public class IK : MonoBehaviour
 
         // Get the DOF indices for the actuators controlling the joints.
         _dofIndices = GetDofIndices(actuators);
+        Debug.LogError($"DOF indices: {string.Join(", ", _dofIndices)}");
+        unsafe
+        {
+            double[] qposCurrent = new double[_dofIndices.Length];
+            for (int i = 0; i < _dofIndices.Length; i++)
+            {
+                qposCurrent[i] = _data->qpos[_dofIndices[i]];
+            }
+            Debug.LogError($"DOF values: {string.Join(", ", qposCurrent)}");
+        }
 
         // Preallocate matrices and vectors for Math.NET Numerics.
         int errDim = 6;
@@ -184,7 +194,7 @@ public class IK : MonoBehaviour
         targetPos[1] = targetPosition.z;
         targetPos[2] = targetPosition.y;
 
-        Quaternion unityQuat = target.rotation;
+        Quaternion unityQuat = Quaternion.Inverse(target.rotation);
         ConvertUnityQuatToMujoco(unityQuat, targetQuat);
 
         // Get current qpos
@@ -368,9 +378,11 @@ public class IK : MonoBehaviour
 
     int GetJointDofNum(int jointType)
     {
+        Debug.Log(jointType);
         switch (jointType)
         {
             case (int)MujocoLib.mjtJoint.mjJNT_FREE:
+                Debug.LogError("Free joint type should not happen.");
                 return 6;
             case (int)MujocoLib.mjtJoint.mjJNT_BALL:
                 return 3;
